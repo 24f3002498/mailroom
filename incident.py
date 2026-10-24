@@ -191,31 +191,63 @@ def render_prompt(b, lines, order, keep=90):
         "Transcript (most relevant lines):\n" + "\n".join(shown))
 
 
+MODEL_OVERRIDE = {}
+
+
+def http_json(url, data=None, timeout=5):
+    hdr = {"Accept": "application/json", "User-Agent": "Mozilla/5.0 (compatible; incident-agent/1.0)",
+           "Authorization": "Bearer " + os.environ.get("LLM_KEY", "")}
+    if data is not None:
+        hdr["Content-Type"] = "application/json"
+    req = urllib.request.Request(url, json.dumps(data).encode() if data is not None else None, hdr)
+    return json.load(urllib.request.urlopen(req, timeout=timeout))
+
+
+def discover_model(url):
+    """The configured model name was rejected: pick an available chat model from the provider's /models list."""
+    try:
+        base = url.rsplit("/chat/completions", 1)[0]
+        ids = [m.get("id", "") for m in http_json(base + "/models", timeout=4).get("data", [])]
+        ids = [i.split("/", 1)[1] if i.startswith("models/") else i for i in ids]
+        bad = re.compile(r"whisper|tts|embed|guard|vision|image|audio|transcri|moderation|imagen|veo|aqa", re.I)
+        ids = [i for i in ids if i and not bad.search(i)]
+        for pref in (r"flash-lite", r"8b-instant", r"instant", r"gpt-oss-20b", r"llama-3\.\d+-8b", r"mini", r"flash", r"llama", r"."):
+            for i in ids:
+                if re.search(pref, i, re.I):
+                    print("MODEL_DISCOVERED", i, flush=True)
+                    return i
+    except Exception as e:
+        print("MODEL_DISCOVERY_ERR", repr(e)[:160], flush=True)
+    return None
+
+
 def call_model(prompt):
     url = os.environ.get("LLM_URL")
-    model = os.environ.get("LLM_MODEL", "unconfigured-model")
+    model = MODEL_OVERRIDE.get("m") or os.environ.get("LLM_MODEL", "unconfigured-model")
     if not url:
         return None, model, "no LLM_URL"
     body = {"model": model, "temperature": 0, "messages": [{"role": "user", "content": prompt}],
-            "response_format": {"type": "json_object"}}
+            "response_format": {"type": "json_object"}, "max_tokens": 300}
     eff = os.environ.get("LLM_EFFORT", "low")
     if eff and eff != "off":
         body["reasoning_effort"] = eff
     deadline = time.time() + LLM_TIMEOUT
     err = None
-    for _ in range(2):
+    for _ in range(3):
         left = deadline - time.time()
-        if left < 2:
+        if left < 1.5:
             break
         try:
-            req = urllib.request.Request(url, json.dumps(body).encode(), {
-                "Content-Type": "application/json", "Accept": "application/json",
-                "User-Agent": "Mozilla/5.0 (compatible; incident-agent/1.0)",
-                "Authorization": "Bearer " + os.environ.get("LLM_KEY", "")})
-            out = json.load(urllib.request.urlopen(req, timeout=left))
-            return out["choices"][0]["message"]["content"], model, None
+            out = http_json(url, body, timeout=left)
+            return out["choices"][0]["message"]["content"], body["model"], None
         except urllib.error.HTTPError as e:
             err = f"HTTP {e.code} {e.read()[:160]!r}"
+            if e.code == 404 and not MODEL_OVERRIDE.get("tried"):
+                MODEL_OVERRIDE["tried"] = True
+                m = discover_model(url)
+                if m:
+                    MODEL_OVERRIDE["m"] = body["model"] = m
+                    continue
             if e.code == 400 and ("reasoning_effort" in body or "response_format" in body):
                 body.pop("reasoning_effort", None) if "reasoning_effort" in body else body.pop("response_format")
                 continue
@@ -223,7 +255,7 @@ def call_model(prompt):
         except Exception as e:
             err = repr(e)[:160]
             break
-    return None, model, err
+    return None, body["model"], err
 
 
 def heuristic_plan(b, lines, order):
@@ -663,6 +695,8 @@ def final_view(run):
 
 
 def current_view(run):
+    if run.get("lastResponse") is not None:
+        return run["lastResponse"]
     if run["status"] in ("completed", "failed"):
         return run["finalResponse"]
     pend = [d for d in run["actionLog"]
@@ -822,6 +856,7 @@ def handle_start(b, headers):
     run, resp = start_run(b, headers)               # model call happens outside the lock
     resp = redact(resp, run["sensitive"])
     run["firstResponse"] = resp
+    run["lastResponse"] = resp
     with LOCK, db() as c:
         old_h, other = load(c, rid)
         if other:
@@ -857,6 +892,7 @@ def handle_receipt(rid, b):
             run["finalResponse"] = resp
         else:
             resp = redact(resp, run["sensitive"])
+        run["lastResponse"] = resp
         save(c, run)
         c.execute("insert into receipts values(?,?,?,?)", (rid, rcid, h, json.dumps(resp)))
         return resp
