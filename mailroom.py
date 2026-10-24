@@ -60,32 +60,39 @@ def db():
 
 
 # ---------------- validation ----------------
+def line_items(d):
+    """Find every {"lineId":..., ...} object anywhere inside a dossier (shape-agnostic)."""
+    out = []
+    def walk(o):
+        if isinstance(o, dict):
+            if isinstance(o.get("lineId"), str):
+                out.append(o)
+            for v in o.values():
+                walk(v)
+        elif isinstance(o, list):
+            for v in o:
+                walk(v)
+    walk(d)
+    return out
+
+
+def line_text(l):
+    return " ".join(str(v) for k, v in l.items() if k != "lineId" and isinstance(v, (str, int, float)))
+
+
 def validate_propose(b):
-    for k in ("evaluationId", "receiptVerifier", "corpus", "allowedActions", "dossiers"):
-        if k not in b:
-            raise Bad(422, f"missing {k}")
-    if not isinstance(b["evaluationId"], str) or not b["evaluationId"]:
+    if not isinstance(b.get("evaluationId"), str) or not b["evaluationId"]:
         raise Bad(422, "bad evaluationId")
-    if not isinstance(b["allowedActions"], list) or not all(a in SCHEMAS for a in b["allowedActions"]):
-        raise Bad(422, "unknown allowed action")
-    if not isinstance(b["dossiers"], list) or not b["dossiers"]:
+    if not isinstance(b.get("dossiers"), list) or not b["dossiers"]:
         raise Bad(422, "bad dossiers")
+    if not isinstance(b.get("allowedActions"), list):
+        raise Bad(422, "bad allowedActions")
     ids = set()
     for d in b["dossiers"]:
         did = d.get("dossierId") if isinstance(d, dict) else None
         if not isinstance(did, str) or did in ids:
             raise Bad(422, "bad or duplicate dossierId")
         ids.add(did)
-        if not isinstance(d.get("lines"), list):
-            raise Bad(422, "dossier lines missing")
-        lids = [l.get("lineId") for l in d["lines"]]
-        if len(set(lids)) != len(lids) or not all(isinstance(x, str) for x in lids):
-            raise Bad(422, "bad or duplicate lineId")
-    try:
-        jwk = b["receiptVerifier"]["publicKeyJwk"]
-        pub_from_jwk(jwk)
-    except Exception:
-        raise Bad(422, "bad receiptVerifier")
 
 
 def check_proposal(p, d, allowed):
@@ -103,7 +110,7 @@ def check_proposal(p, d, allowed):
     if p["action"] == "quarantine_item" and set(pl) != pkeys:
         raise Bad(422, "bad payload")
     ev = p.get("evidence")
-    have = {l["lineId"] for l in d["lines"]}
+    have = {l["lineId"] for l in line_items(d)}
     if not isinstance(ev, list) or not ev or len(set(ev)) != len(ev) or not set(ev) <= have:
         raise Bad(422, "bad evidence")
 
@@ -136,8 +143,8 @@ def ask_llm(d, allowed):
 
 def fallback(d, allowed):
     """Safe deterministic fallback: quarantine on injection signs, else ask for confirmation."""
-    lines = d["lines"]
-    hit = [l["lineId"] for l in lines if INJ.search(str(l.get("text", "")))]
+    lines = line_items(d)
+    hit = [l["lineId"] for l in lines if INJ.search(line_text(l))]
     art = str(d.get("artifactId") or d["dossierId"])
     if hit and "quarantine_item" in allowed:
         return {"action": "quarantine_item", "target": None,
@@ -151,6 +158,7 @@ def fallback(d, allowed):
 
 
 def decide(d, allowed):
+    allowed = [a for a in allowed if a in SCHEMAS]
     try:
         p = ask_llm(d, allowed)
         if p:
@@ -282,8 +290,10 @@ class H(BaseHTTPRequestHandler):
                 raise Bad(422, "unknown operation")
             self._send(200, out)
         except Bad as e:
+            print("REJECT", e.code, e.msg, (raw[:1500] if "raw" in dir() else b""), flush=True)
             self._send(e.code, {"error": e.msg})
         except Exception as e:
+            import traceback; traceback.print_exc()
             self._send(500, {"error": "internal error"})
 
     def _send(self, code, obj):
