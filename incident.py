@@ -582,7 +582,7 @@ def start_run(b, headers):
         dispatches.append(new_dispatch(run, act, 1, t))
     if len(plan["diagnostics"]) > 1:
         run["joinSpan"] = hexid(8)
-    resp = {"runId": rid, "status": "waiting", "diagnosis": run["diagnosis"], "dispatches": dispatches, "approvals": []}
+    resp = waiting_view(run, dispatches, [])
     return run, resp
 
 
@@ -688,11 +688,17 @@ def apply_receipt(run, r):
     busy = any(a["state"] in ("pending", "awaiting_approval") for a in run["actions"])
     if busy or dispatches or approvals:
         run["status"] = "waiting"
-        return {"runId": run["runId"], "status": "waiting", "diagnosis": run["diagnosis"],
-                "dispatches": dispatches, "approvals": approvals}
+        return waiting_view(run, dispatches, approvals)
     effect = next((a for a in run["actions"] if a["phase"] == "effect"), None)
     run["status"] = "completed" if effect and effect["state"] == "succeeded" else "failed"
     return final_view(run)
+
+
+def waiting_view(run, dispatches, approvals):
+    return {"runId": run["runId"], "status": "waiting", "diagnosis": run["diagnosis"],
+            "chosenEffect": run["chosenEffect"], "suppressed": run["suppressed"],
+            "dispatches": dispatches, "approvals": approvals,
+            "actionLog": run["actionLog"], "receiptLog": run["receiptLog"], "otlp": build_otlp(run)}
 
 
 def final_view(run):
@@ -702,6 +708,8 @@ def final_view(run):
 
 
 def current_view(run):
+    if run.get("lastResponse") is not None:
+        return run["lastResponse"]
     if run["status"] in ("completed", "failed"):
         return run["finalResponse"]
     pend = [d for d in run["actionLog"]
