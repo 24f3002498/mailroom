@@ -881,6 +881,7 @@ def debug_page():
         out.append(f"=== RUN {rid} status={st.get('status')} source={st.get('planSource')} model={st.get('model')}")
         out.append("PLAN " + json.dumps(st.get("plan")))
         out.append("RECEIPTS " + json.dumps(st.get("receiptLog")))
+        out.append("FIRST " + json.dumps(st.get("firstResponse")))
         out.append("SUPPRESSED " + json.dumps(st.get("suppressed")))
         inc = b.get("incident", {})
         out.append("INCIDENT " + json.dumps({k: v for k, v in inc.items() if k != "transcript"}))
@@ -905,8 +906,14 @@ class H(BaseHTTPRequestHandler):
         except Exception:
             raise Bad(400, "invalid JSON")
 
+    def log_req(self, extra=""):
+        h = self.headers
+        print("REQ", self.command, self.path[:90], "tp=" + str(h.get("traceparent")), "ts=" + str(h.get("tracestate")),
+              "ua=" + str(h.get("User-Agent"))[:40], extra, flush=True)
+
     def do_POST(self):
         path = self.path.split("?")[0].rstrip("/")
+        self.log_req()
         try:
             b = self._body()
             if path.endswith("/v2/incidents"):
@@ -918,7 +925,8 @@ class H(BaseHTTPRequestHandler):
                 if not m:
                     raise Bad(404, "not found")
                 out = handle_receipt(urllib.request.unquote(m.group(1)), b)
-            print("OK POST", path[-60:], out.get("status"), flush=True)
+            print("OK POST", path[-60:], out.get("status"), "dispatches=" + json.dumps([[d.get("toolName"), d.get("attempt")] for d in out.get("dispatches") or []]),
+                  "approvals=" + str(len(out.get("approvals") or [])), flush=True)
             self._send(200, out)
         except Bad as e:
             print("REJECT", e.code, e.msg, path[-60:], flush=True)
@@ -929,6 +937,8 @@ class H(BaseHTTPRequestHandler):
 
     def do_GET(self):
         path = self.path.split("?")[0].rstrip("/")
+        if "/debug/" not in path:
+            self.log_req()
         try:
             if DEBUG_TOKEN and path.endswith("/debug/" + DEBUG_TOKEN):
                 body = debug_page().encode()
@@ -940,7 +950,9 @@ class H(BaseHTTPRequestHandler):
                 return
             m = re.search(r"/v2/incidents/([^/]+)$", path)
             if m:
-                return self._send(200, handle_get(urllib.request.unquote(m.group(1))))
+                out = handle_get(urllib.request.unquote(m.group(1)))
+                print("OK GET", out.get("status"), flush=True)
+                return self._send(200, out)
             self._send(200, {"service": "incident-agent", "profile": PROFILE})
         except Bad as e:
             self._send(e.code, {"error": e.msg})
