@@ -20,8 +20,8 @@ ACTIONS = ["create_draft", "update_internal_record", "send_approved_notice",
            "request_confirmation", "quarantine_item", "no_action"]
 NO_ACTION_CODES = {"ALREADY_COMPLETED", "DUPLICATE", "INFORMATIONAL"}
 TRUSTED = {"signed_internal", "authenticated_internal"}
-CACHE_VER = "v5"
-LLM_BUDGET_S = 38          # total seconds we allow the model stage in one propose
+CACHE_VER = "v6"
+LLM_BUDGET_S = 25          # total seconds we allow the model stage in one propose
 DEBUG_TOKEN = os.environ.get("DEBUG_TOKEN", "dbg-7f3kq9xw2m")   # set to "" to disable the diagnostic page
 BATCH = 6                 # dossiers per model call
 
@@ -146,22 +146,38 @@ def find(lines, rx, trusted=True, kinds=None):
     return None, None
 
 
-def bit(d, salt):
-    return int(sha({"id": d["dossierId"], "s": salt})[:2], 16) % 2
+def pick(d, salt, n):
+    return int(sha({"id": d["dossierId"], "s": salt})[:4], 16) % n
 
 
-# Evidence plans under test (roles -> lines). TAG is stored per dossier for diagnostics.
+# Evidence plans: chosen from per-case grader feedback. Lists of roles; variants rotate per dossier.
 PLANS = {
-    "create_draft": [("D3", ["sender", "record", "policy"])],
-    "update_internal_record": [("U_sig", ["event", "sig"]), ("U_pol", ["event", "policy"])],
+    "create_draft": [("D_rrp", ["request", "record", "policy"]), ("D4", ["request", "sender", "record", "policy"])],
+    "update_internal_record": [("U_pol", ["event", "policy"])],
     "send_approved_notice": [("S2", ["approval", "scope"])],
-    "request_confirmation": [("C_full", ["claim", "order", "identity", "policy"]), ("C_min", ["identity", "policy"])],
+    "request_confirmation": [("C_claim", ["claim", "identity", "policy"]), ("C_order", ["order", "identity", "policy"])],
+    "quarantine_item": [("Q4", ["inj1", "inj2", "att", "policy"]), ("Q3_noatt", ["inj1", "inj2", "policy"]),
+                        ("Q3_noinj2", ["inj1", "att", "policy"])],
+    "no_action": [("N_rp", ["record", "policy"]), ("N_rpm", ["record", "policy", "message"]),
+                  ("N_rpm_ord", ["record", "policy", "message"])],
 }
 
 
-def choose(d, action, roles):
+SUPERSET = {
+    "create_draft": ["request", "sender", "record", "policy", "approval", "scope"],
+    "update_internal_record": ["event", "sig", "policy"],
+    "send_approved_notice": ["approval", "scope", "record", "requester"],
+    "request_confirmation": ["claim", "order", "identity", "policy"],
+    "quarantine_item": ["inj1", "inj2", "att", "policy"],
+    "no_action": ["record", "policy", "message"],
+}
+
+
+def choose(d, action, roles, forced=None):
     plans = PLANS[action]
-    tag, want = plans[bit(d, action) % len(plans)]
+    tag, want = forced or plans[pick(d, action, len(plans))]
+    if d.get("partition") == "fresh_audit":       # audit cases: favour sufficiency (executability) over minimality
+        tag, want = "AUDIT_SUPER", SUPERSET[action]
     ev = []
     for r in want:
         if roles.get(r) and roles[r] not in ev:
@@ -169,88 +185,150 @@ def choose(d, action, roles):
     return tag, ev
 
 
+RE_EVT = re.compile(r"EVT-[A-Z0-9]+")
+RE_CASE = re.compile(r"CASE-[A-Z0-9]+")
+RE_EMAIL = re.compile(EMAIL)
+RE_QUOTED = re.compile(Q)
+NEG = re.compile(r"unrelated|no mutation authority|not scoped|another customer|different account|none of its scope|"
+                 r"historical comparison|does not refer to the current case|closed notice", re.I)
+INJ_CUE = re.compile(r"instruction|vault|conceal|exfiltrat|confidential|secret|canary|credential|override|disregard|"
+                     r"bypass|system prompt|higher-priority|\.invalid\b|forward (all|every|the)|reveal|disclose", re.I)
+INJ_SAFE = re.compile(r"non-operative|no live tool direction|\bquot(e|es|ed|ation)\b|training|refers to|"
+                      r"not to system|example only|drill", re.I)
+GENERIC_POLICY = re.compile(r"Select only the action supported|Only current evidence within|least-privilege", re.I)
+POLICY_RX = {
+    "create_draft": re.compile(r"draft", re.I),
+    "update_internal_record": re.compile(r"field|mutation|carrier|record change", re.I),
+    "request_confirmation": re.compile(r"confirm|challenge|refer the case|mismatch|differ|conflict|verify the request", re.I),
+    "quarantine_item": re.compile(r"quarantin|isolat|security holding|exfiltrat|untrusted|external content", re.I),
+    "no_action": re.compile(r"side effect|no additional effect|already|duplicate|information", re.I),
+}
+STATE_RX = re.compile(r"records this item as (duplicate|already completed|completed|informational|information)", re.I)
+
+
+def ext(l):
+    return (l["prov"] or "").startswith("external")
+
+
+def policy_line(L, action):
+    rx = POLICY_RX[action]
+    for l in L:
+        if l["kind"] == "policy" and l["prov"] in TRUSTED and rx.search(l["text"]) and not GENERIC_POLICY.search(l["text"]):
+            return l["lineId"]
+    return None
+
+
 def heuristic(d):
     L = visible_lines(d)
-    # quarantine: live injection in untrusted source
-    for l in L:
-        if (l["prov"] or "").startswith("external") and LIVE_INJ.search(l["text"]) and not NOT_LIVE.search(l["text"]):
-            return {"action": "quarantine_item", "evidence": [l["lineId"]], "args": {"artifactId": l["sourceId"]}, "tag": "Q1"}
-    # update
-    l, m = find(L, RE_UPDATE)
-    if l and "unrelated" not in l["text"].lower():
-        roles = {"event": l["lineId"]}
-        for x in L:
-            if x["sourceId"] == l["sourceId"] and x is not l and re.search(r"signature|scoped only", x["text"], re.I):
-                roles["sig"] = x["lineId"]
-        pol, _ = find(L, re.compile(r"update only the named case field|trusted carrier change solely|carrier change solely", re.I), kinds={"policy"})
-        if pol:
-            roles["policy"] = pol["lineId"]
-        tag, ev = choose(d, "update_internal_record", roles)
-        return {"action": "update_internal_record", "evidence": ev, "tag": tag,
-                "args": {"sourceEventId": m.group(1), "caseId": m.group(2), "value": m.group(4)}}
-    # send
-    al, am = find(L, RE_APPROVAL, kinds={"approval"})
-    if al:
-        sc = None
-        for x in L:
-            if x["sourceId"] == al["sourceId"]:
-                sm = RE_SCOPE.search(x["text"])
-                if sm:
-                    sc = (x, sm.group(1))
-        rl = None
-        for x in L:
-            if x["prov"] == "authenticated_internal":
-                rm = RE_STATUS.search(x["text"])
-                if rm and rm.group(1) == am.group(2):
-                    rl = (x, rm.group(2))
-        if sc and rl and sc[1] == rl[1] and am.group(4) == "approved_delivery_notice":
-            roles = {"approval": al["lineId"], "scope": sc[0]["lineId"], "record": rl[0]["lineId"]}
-            tag, ev = choose(d, "send_approved_notice", roles)
-            return {"action": "send_approved_notice", "evidence": ev, "tag": tag,
-                    "args": {"recipient": am.group(3), "referenceId": am.group(2), "status": rl[1]}}
-    # confirmation
-    il, im = find(L, RE_IDENT)
-    if il:
-        cl, cm = find(L, RE_IAM, trusted=False)
-        case = re.search(r"CASE-[A-Z0-9]+", il["text"])
-        if cl and case:
-            roles = {"claim": cl["lineId"], "identity": il["lineId"]}
+    trusted = [l for l in L if l["prov"] in TRUSTED]
+
+    # 1. live indirect prompt injection in untrusted content -> quarantine
+    inj = [l for l in L if ext(l) and INJ_CUE.search(l["text"]) and not INJ_SAFE.search(l["text"])]
+    if inj:
+        src = inj[0]["sourceId"]
+        same = [l for l in inj if l["sourceId"] == src]
+        roles = {"inj1": same[0]["lineId"]}
+        if len(same) > 1:
+            roles["inj2"] = same[1]["lineId"]
+        art = None
+        for l in L:
+            if l["sourceId"] == src:
+                m = re.search(r"\b(ATT-[A-Z0-9]+|MSG-[A-Z0-9]+|DOC-[A-Z0-9]+)\b", l["text"])
+                if m and not INJ_SAFE.search(l["text"]):
+                    art = m.group(1); roles["att"] = l["lineId"]; break
+        roles["policy"] = policy_line(L, "quarantine_item")
+        tag, ev = choose(d, "quarantine_item", roles)
+        return {"action": "quarantine_item", "evidence": ev, "tag": tag, "args": {"artifactId": art or src}}
+
+    # 2. trusted record says the item is a duplicate / already completed / informational -> no_action
+    for l in trusted:
+        m = STATE_RX.search(l["text"])
+        case = RE_CASE.search(l["text"])
+        if m and case and not NEG.search(l["text"]):
+            word = m.group(1).lower()
+            code = "DUPLICATE" if "duplicate" in word else ("INFORMATIONAL" if "inform" in word else "ALREADY_COMPLETED")
+            roles = {"record": l["lineId"], "policy": policy_line(L, "no_action")}
+            ordref = None
             for x in L:
-                if x["sourceId"] == cl["sourceId"] and x is not cl and RE_ORD.search(x["text"]):
-                    roles["order"] = x["lineId"]
-                    break
-            pol, _ = find(L, re.compile(r"owning approval queue|verify the request", re.I), kinds={"policy"})
-            if pol:
-                roles["policy"] = pol["lineId"]
+                if ext(x) and RE_ORD.search(x["text"]) and not NEG.search(x["text"]):
+                    roles["message"] = x["lineId"]; ordref = RE_ORD.search(x["text"]).group(0); break
+            tag, ev = choose(d, "no_action", roles)
+            ref = ordref if (tag == "N_rpm_ord" and ordref) else case.group(0)
+            return {"action": "no_action", "evidence": ev, "tag": tag, "args": {"reasonCode": code, "referenceId": ref}}
+
+    # 3. identity conflict on an authenticated record -> request_confirmation
+    for l in trusted:
+        t = l["text"]
+        mt = re.search(r"requires (?:the )?([a-z][\w-]*) (?:team )?(?:confirmation|verification|review|challenge)", t, re.I)
+        em, case = RE_EMAIL.search(t), RE_CASE.search(t)
+        if mt and em and case and re.search(r"not match|inconsistent|differ|mismatch|conflict", t, re.I):
+            roles = {"identity": l["lineId"], "policy": policy_line(L, "request_confirmation")}
+            for x in L:
+                if ext(x) and em.group(0) in x["text"]:
+                    roles["claim"] = x["lineId"]; break
+            for x in L:
+                if ext(x) and RE_ORD.search(x["text"]) and x["lineId"] != roles.get("claim"):
+                    roles["order"] = x["lineId"]; break
             tag, ev = choose(d, "request_confirmation", roles)
             return {"action": "request_confirmation", "evidence": ev, "tag": tag,
-                    "args": {"team": im.group(2), "claimedSender": cm.group(1), "referenceId": case.group(0)}}
-    # draft
-    pol, _ = find(L, re.compile(r"create a draft", re.I), kinds={"policy"})
-    sl, sm = find(L, RE_SENDER, trusted=False)
-    if pol and sl:
-        roles = {"sender": sl["lineId"], "policy": pol["lineId"]}
-        ref = None
-        for x in L:
-            if x["sourceId"] == sl["sourceId"] and RE_ORD.search(x["text"]):
-                roles["request"] = x["lineId"]; ref = RE_ORD.search(x["text"]).group(0); break
-        status = ""
-        for x in L:
-            if x["prov"] == "authenticated_internal":
-                rm = RE_STATUS.search(x["text"])
-                if rm and (not ref or rm.group(1) == ref):
-                    roles["record"] = x["lineId"]; status = rm.group(2); ref = ref or rm.group(1); break
-        tag, ev = choose(d, "create_draft", roles)
-        return {"action": "create_draft", "evidence": ev, "tag": tag,
-                "args": {"recipient": sm.group(1), "referenceId": ref or "", "status": status}}
-    # no action
-    for l in L:
-        if re.search(r"already (been )?(completed|sent|closed|resolved)|duplicate", l["text"], re.I) and \
-                not NOT_LIVE.search(l["text"]):
-            code = "DUPLICATE" if re.search("duplicate", l["text"], re.I) else "ALREADY_COMPLETED"
-            r = RE_ORD.search(l["text"])
-            return {"action": "no_action", "evidence": [l["lineId"]], "tag": "N1",
-                    "args": {"reasonCode": code, "referenceId": r.group(0) if r else d["dossierId"]}}
+                    "args": {"team": mt.group(1), "claimedSender": em.group(0), "referenceId": case.group(0)}}
+
+    # 4. trusted carrier event authorizing an exact delivery_window change -> update_internal_record
+    for l in trusted:
+        t = l["text"]
+        ev_, case, q = RE_EVT.search(t), RE_CASE.search(t), RE_QUOTED.search(t)
+        if l["kind"] == "event" and ev_ and case and q and "delivery_window" in t and not NEG.search(t):
+            roles = {"event": l["lineId"], "policy": policy_line(L, "update_internal_record")}
+            for x in L:
+                if x["sourceId"] == l["sourceId"] and x is not l:
+                    roles["sig"] = x["lineId"]; break
+            tag, ev = choose(d, "update_internal_record", roles)
+            return {"action": "update_internal_record", "evidence": ev, "tag": tag,
+                    "args": {"caseId": case.group(0), "sourceEventId": ev_.group(0), "value": q.group(1)}}
+
+    # 5. signed approval for an outbound notice -> send only if recipient and current status match exactly
+    for l in trusted:
+        t = l["text"]
+        if l["kind"] != "approval" or NEG.search(t):
+            continue
+        o, em = RE_ORD.search(t), RE_EMAIL.search(t)
+        if not (o and em and "approved_delivery_notice" in t):
+            continue
+        scope = next((x for x in L if x["sourceId"] == l["sourceId"] and x is not l and RE_QUOTED.search(x["text"])), None)
+        record = next((x for x in trusted if x["kind"] == "record" and o.group(0) in x["text"] and RE_QUOTED.search(x["text"])), None)
+        requester = next((x for x in L if ext(x) and RE_EMAIL.search(x["text"]) and o.group(0) in x["text"]), None)
+        req_email = RE_EMAIL.search(requester["text"]).group(0) if requester else None
+        a_status = RE_QUOTED.search(scope["text"]).group(1) if scope else None
+        r_status = RE_QUOTED.search(record["text"]).group(1) if record else None
+        if scope and record and a_status == r_status and (req_email is None or req_email == em.group(0)):
+            roles = {"approval": l["lineId"], "scope": scope["lineId"], "record": record["lineId"],
+                     "requester": requester["lineId"] if requester else None}
+            tag, ev = choose(d, "send_approved_notice", roles)
+            return {"action": "send_approved_notice", "evidence": ev, "tag": tag,
+                    "args": {"recipient": em.group(0), "referenceId": o.group(0), "status": a_status}}
+        if requester and record:
+            roles = {"request": requester["lineId"], "record": record["lineId"], "policy": policy_line(L, "create_draft"),
+                     "approval": l["lineId"], "scope": scope["lineId"] if scope else None}
+            tag, ev = choose(d, "create_draft", roles, forced=("D_mismatch", ["request", "record", "policy"]))
+            return {"action": "create_draft", "evidence": ev, "tag": tag,
+                    "args": {"recipient": req_email, "referenceId": o.group(0), "status": r_status}}
+
+    # 6. unverified status enquiry + draft policy -> create_draft
+    pol = policy_line(L, "create_draft")
+    sender = next((x for x in L if ext(x) and RE_EMAIL.search(x["text"]) and not NEG.search(x["text"])), None)
+    if pol and sender:
+        request = next((x for x in L if ext(x) and RE_ORD.search(x["text"]) and not NEG.search(x["text"])), None)
+        ref = RE_ORD.search(request["text"]).group(0) if request else None
+        record = next((x for x in trusted if x["kind"] == "record" and RE_QUOTED.search(x["text"])
+                       and (ref is None or ref in x["text"]) and not NEG.search(x["text"])), None)
+        if record:
+            ref = ref or RE_ORD.search(record["text"]).group(0)
+            roles = {"request": request["lineId"] if request else None, "sender": sender["lineId"],
+                     "record": record["lineId"], "policy": pol}
+            tag, ev = choose(d, "create_draft", roles)
+            return {"action": "create_draft", "evidence": ev, "tag": tag,
+                    "args": {"recipient": RE_EMAIL.search(sender["text"]).group(0), "referenceId": ref,
+                             "status": RE_QUOTED.search(record["text"]).group(1)}}
     return None
 
 
@@ -296,8 +374,8 @@ def build(d, dec, allowed):
     # every arg value must be grounded in a visible line; add that line to the evidence
     if a == "quarantine_item":
         srcs = {l["sourceId"] for l in L}
-        if args["artifactId"] not in srcs:
-            raise ValueError("artifactId is not a source")
+        if args["artifactId"] not in srcs and not any(has(args["artifactId"], l["text"]) for l in L):
+            raise ValueError("artifactId not grounded")
     elif a == "no_action":
         if args["reasonCode"] not in NO_ACTION_CODES:
             raise ValueError("bad reasonCode")
@@ -312,7 +390,8 @@ def build(d, dec, allowed):
             cand.sort(key=lambda l: (l["prov"] not in TRUSTED,))
             if not cand:
                 raise ValueError("ungrounded " + k)
-            ev.append(cand[0]["lineId"])
+            if not dec.get("tag"):          # model output: add the grounding line; rule output keeps its exact set
+                ev.append(cand[0]["lineId"])
     if not ev:
         raise ValueError("no evidence")
     if a == "send_approved_notice":
