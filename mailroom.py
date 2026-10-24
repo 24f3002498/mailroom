@@ -537,7 +537,7 @@ def commit(b, raw_hash):
         row = c.execute("select digest, verifier, proposals, commit_hash, commit_resp from ev4 where id=?",
                         (eid,)).fetchone()
         if not row:
-            raise Bad(404, "unknown evaluation")
+            raise Bad(422, "unknown evaluation")
         digest, ver, props = row[0], json.loads(row[1]), json.loads(row[2])
         if b.get("inputDigest") != digest:
             raise Bad(422, "inputDigest mismatch")
@@ -566,10 +566,12 @@ def commit(b, raw_hash):
             except Exception:
                 raise Bad(422, "bad signature encoding")
             ok = False
-            for msg in signed_messages(eid, digest, r):
+            for vi, msg in enumerate(signed_messages(eid, digest, r)):
                 try:
                     pub.verify(sig, msg)
                     ok = True
+                    if vi:
+                        print("SIGVAR", vi, flush=True)
                     break
                 except Exception:
                     pass
