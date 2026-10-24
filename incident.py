@@ -338,6 +338,7 @@ def validate_plan(p, b, lines):
             "effect": {"toolName": eff["toolName"], "arguments": eff.get("arguments") or {}, "evidence": eev}}
 
 
+VARIANT = {}
 NOISE_BODIES = [
     "Routine backup validation completed successfully in another region",
     "The support channel contains competing guesses from several teams",
@@ -411,6 +412,11 @@ def rules_plan(b, lines, order):
         r"replica|maximum|freeze|ceiling|runbook|holdback|disabled|no deployment|incident-window|notAfter|revocation|"
         r"internal endpoints|requests per second|policy", text[i], re.I)]
     ev = (rel + facts)[:4]
+    if int(hashlib.sha256(svc.encode()).hexdigest()[:2], 16) % 2:
+        ev = ev[:2]
+        VARIANT[svc] = "ev2"
+    else:
+        VARIANT[svc] = "ev3"
     if len(ev) < 2:
         ev = (ev + [i for i in sig if i not in ev])[:2]
     alltext = " ".join(text[i] for i in sig)
@@ -568,7 +574,8 @@ def start_run(b, headers):
            "chosenEffect": None, "effectCreated": False, "sensitive": sensitive_values(b)}
     dispatches = []
     for i, dg in enumerate(plan["diagnostics"]):
-        act = {"actionId": stable_id("act", rid, "diag", str(i)), "callId": stable_id("call", rid, "diag", str(i)),
+        aid = stable_id("act", rid, "diag", str(i))
+        act = {"actionId": aid, "callId": aid if VARIANT.get(b["incident"].get("service")) == "ev2" else stable_id("call", rid, "diag", str(i)),
                "phase": "diagnostic", "toolName": dg["toolName"], "arguments": dg["arguments"], "evidence": dg["evidence"],
                "toolSpan": hexid(8), "attempts": [], "state": "pending", "pendingAttempt": None}
         run["actions"].append(act)
@@ -944,8 +951,8 @@ class H(BaseHTTPRequestHandler):
 
     def log_req(self, extra=""):
         h = self.headers
-        print("REQ", self.command, self.path[:90], "tp=" + str(h.get("traceparent")), "ts=" + str(h.get("tracestate")),
-              "ua=" + str(h.get("User-Agent"))[:40], extra, flush=True)
+        hd = {k: (v if k.lower() not in ("authorization", "cookie") else "[REDACTED]")[:120] for k, v in h.items()}
+        print("REQ", self.command, self.path[:90], json.dumps(hd), extra, flush=True)
 
     def do_POST(self):
         path = self.path.split("?")[0].rstrip("/")
@@ -961,7 +968,7 @@ class H(BaseHTTPRequestHandler):
                 if not m:
                     raise Bad(404, "not found")
                 out = handle_receipt(urllib.request.unquote(m.group(1)), b)
-            print("OK POST", path[-60:], out.get("status"), "dispatches=" + json.dumps([[d.get("toolName"), d.get("attempt")] for d in out.get("dispatches") or []]),
+            print("OK POST", path[-60:], (b.get("runId") if isinstance(b, dict) else ""), out.get("status"), "dispatches=" + json.dumps([[d.get("toolName"), d.get("attempt")] for d in out.get("dispatches") or []]),
                   "approvals=" + str(len(out.get("approvals") or [])), flush=True)
             self._send(200, out)
         except Bad as e:
@@ -987,7 +994,7 @@ class H(BaseHTTPRequestHandler):
             m = re.search(r"/v2/incidents/([^/]+)$", path)
             if m:
                 out = handle_get(urllib.request.unquote(m.group(1)))
-                print("OK GET", out.get("status"), flush=True)
+                print("OK GET", m.group(1), out.get("status"), flush=True)
                 return self._send(200, out)
             self._send(200, {"service": "incident-agent", "profile": PROFILE})
         except Bad as e:
