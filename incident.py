@@ -702,8 +702,6 @@ def final_view(run):
 
 
 def current_view(run):
-    if run.get("lastResponse") is not None:
-        return run["lastResponse"]
     if run["status"] in ("completed", "failed"):
         return run["finalResponse"]
     pend = [d for d in run["actionLog"]
@@ -733,6 +731,7 @@ def build_otlp(run):
 
     def span(sid, parent, name, kind, start, end, attrs, status=None, links=None):
         s = {"traceId": tid, "spanId": sid, "name": name, "kind": kind,
+             **({"traceState": run["tracestate"]} if run.get("tracestate") else {}),
              "startTimeUnixNano": str(start), "endTimeUnixNano": str(max(end or start, start)),
              "attributes": [{"key": k, "value": av(v)} for k, v in dict(base, **attrs).items()],
              "status": status or {}}
@@ -970,7 +969,7 @@ class H(BaseHTTPRequestHandler):
                 out = handle_receipt(urllib.request.unquote(m.group(1)), b)
             print("OK POST", path[-60:], (b.get("runId") if isinstance(b, dict) else ""), out.get("status"), "dispatches=" + json.dumps([[d.get("toolName"), d.get("attempt")] for d in out.get("dispatches") or []]),
                   "approvals=" + str(len(out.get("approvals") or [])), flush=True)
-            self._send(200, out)
+            self._send(200, out, self._trace_headers(out))
         except Bad as e:
             print("REJECT", e.code, e.msg, path[-60:], flush=True)
             self._send(e.code, {"error": e.msg})
@@ -1003,9 +1002,24 @@ class H(BaseHTTPRequestHandler):
             traceback.print_exc()
             self._send(500, {"error": "internal error"})
 
-    def _send(self, code, obj):
+    def _trace_headers(self, out):
+        try:
+            with LOCK, db() as c:
+                _, run = load(c, out.get("runId"))
+            if run:
+                h = {"traceparent": f"00-{run['traceId']}-{run['serverSpan']}-01"}
+                if run.get("tracestate"):
+                    h["tracestate"] = run["tracestate"]
+                return h
+        except Exception:
+            pass
+        return {}
+
+    def _send(self, code, obj, extra=None):
         d = json.dumps(obj, separators=(",", ":")).encode()
         self.send_response(code)
+        for k, v in (extra or {}).items():
+            self.send_header(k, v)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(d)))
         self.end_headers()
