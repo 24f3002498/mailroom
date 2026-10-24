@@ -264,6 +264,17 @@ def commit(b):
 
 
 # ---------------- HTTP ----------------
+def shrink(o, n=2, depth=0):
+    """Compact view of a JSON value for logs: first n list items, long strings cut."""
+    if isinstance(o, dict):
+        return {k: shrink(v, n, depth + 1) for k, v in o.items()}
+    if isinstance(o, list):
+        return [shrink(v, n, depth + 1) for v in o[:n]] + ([f"...({len(o)} items)"] if len(o) > n else [])
+    if isinstance(o, str) and len(o) > 400:
+        return o[:400] + "...(cut)"
+    return o
+
+
 class H(BaseHTTPRequestHandler):
     def do_POST(self):
         try:
@@ -282,12 +293,14 @@ class H(BaseHTTPRequestHandler):
             if not isinstance(b, dict) or b.get("profile") != PROFILE:
                 raise Bad(422, "bad profile")
             op = b.get("operation")
+            print("REQ", json.dumps(shrink(b))[:7000], flush=True)
             if op == "propose":
                 out = propose(b, sha(b))
             elif op == "commit":
                 out = commit(b)
             else:
                 raise Bad(422, "unknown operation")
+            print("RESP", json.dumps(shrink(out))[:3000], flush=True)
             self._send(200, out)
         except Bad as e:
             print("REJECT", e.code, e.msg, (raw[:1500] if "raw" in dir() else b""), flush=True)
