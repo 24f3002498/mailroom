@@ -166,16 +166,52 @@ def decide(d, allowed):
                  "payload": p.get("payload") or {}, "evidence": p.get("evidence")}
             check_proposal(p, d, allowed)
             return p
-    except Exception:
-        pass
+    except Exception as e:
+        print('LLM_ERR', repr(e)[:300], 'url_set=', bool(os.environ.get('LLM_URL')), flush=True)
     p = fallback(d, allowed)
     check_proposal(p, d, allowed)
     return p
 
 
 # ---------------- propose ----------------
+DISCOVERED = False
+
+
+def discover(b):
+    """One-time debug dump so the real contract can be read from the logs."""
+    global DISCOVERED
+    if DISCOVERED:
+        return
+    DISCOVERED = True
+    try:
+        ds = b["dossiers"]
+        print("DISC_KEYS top=", sorted(b), "dossier=", sorted(ds[0]), flush=True)
+        kinds, titles, hits = {}, {}, {}
+        for d in ds:
+            for src in d.get("sources", []) if isinstance(d, dict) else []:
+                k = (src.get("kind"), src.get("provenance"))
+                kinds[k] = kinds.get(k, 0) + 1
+                titles[(src.get("kind"), src.get("title"))] = 1
+                for l in src.get("lines", []):
+                    t = str(l.get("text", ""))
+                    if re.search(r"target|payload|schema|argument|field|template|queue|reasonCode|kind|typed", t, re.I):
+                        hits[t[:300]] = l.get("lineId")
+        print("DISC_KINDS", json.dumps([[list(k), v] for k, v in kinds.items()]), flush=True)
+        print("DISC_TITLES", json.dumps(sorted(map(list, titles)))[:4000], flush=True)
+        for i, (t, lid) in enumerate(hits.items()):
+            if i >= 50:
+                break
+            print("DISC_LINE", lid, t, flush=True)
+        for i in (0, 1, 2, 3, 40, 60):
+            if i < len(ds):
+                print("DISC_DOSSIER", i, json.dumps(ds[i])[:9000], flush=True)
+    except Exception as e:
+        print("DISC_ERR", repr(e), flush=True)
+
+
 def propose(b, raw_hash):
     validate_propose(b)
+    discover(b)
     eid = b["evaluationId"]
     with LOCK, db() as c:
         row = c.execute("select req, digest, proposals from ev where id=?", (eid,)).fetchone()
