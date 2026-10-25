@@ -289,14 +289,14 @@ def principal_of(headers):
 
 def check_version(headers):
     v = (headers.get("a2a-version") or "").strip()
-    if v != "1.0":
+    if v and v != "1.0":                     # absent header: assume the 1.0 binding; any other version is rejected
         raise Err("VERSION_NOT_SUPPORTED", 400, "A2A-Version 1.0 is required")
 
 
 def check_media(headers):
     ct = (headers.get("content-type") or "").split(";")[0].strip().lower()
-    if ct != A2A_MT:
-        raise Err("UNSUPPORTED_MEDIA_TYPE", 415, "Content-Type must be application/a2a+json")
+    if ct not in (A2A_MT, "application/json"):
+        raise Err("UNSUPPORTED_MEDIA_TYPE", 415, "Content-Type must be application/a2a+json or application/json")
 
 
 def task_view(task, history_length=None):
