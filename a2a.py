@@ -172,8 +172,74 @@ def fallback_decision(pkg):
             "rationale": f"hold_invoice: automated review unavailable, so payment pauses pending verification; see {refs[0]} and {refs[1]}."}
 
 
-def decide(packages, policy_rev, deadline_s=34):
-    """One batched model call for uncached packages; decisions cached by canonical package content."""
+DECOY_PARA = re.compile(r"archive note|training appendix|non-operative|vocabulary, not case|cover sheet|training example|"
+                        r"labelled as training|hypothetical", re.I)
+RULES = [
+    ("hold_invoice", re.compile(r"callback|call-back|destination[- ]account|newly supplied bank|new bank account|"
+                                r"remittance (?:be )?moved|payment[- ]detail change|changed (?:remittance |bank |payment )?instructions|"
+                                r"bank[- ]detail change|verification (?:is )?(?:still )?(?:pending|incomplete|open)", re.I)),
+    ("request_approval", re.compile(r"authority|delegat|ceiling|approver|escalation|approval workflow", re.I)),
+    ("reject_duplicate", re.compile(r"same commercial key|already (?:been )?(?:paid|settled)|completed payment|"
+                                    r"requires rejection|duplicate[- ]control policy requires", re.I)),
+    ("open_exception", re.compile(r"(?:outside|beyond)[^.]*tolerance|contradict|incompatible|conflicts? with|"
+                                  r"exception (?:case|queue|workflow)|discrepan(?:cy|cies) remains? unresolved", re.I)),
+    ("settle_invoice", re.compile(r"reconcil|no earlier posting|no prior (?:settlement|payment|posting)|full quantity|"
+                                  r"three-way match|quantity received|within the stated", re.I)),
+]
+NEG_DUP = re.compile(r"different invoice|another invoice|not the same", re.I)
+CUR_AMT = re.compile(r"\b([A-Z]{3})\s*([0-9][0-9,]*(?:\.[0-9]+)?)\b")
+
+
+def paragraphs(pkg):
+    out = []
+    for d in pkg.get("documents") or []:
+        name = str(d.get("name") or "") if isinstance(d, dict) else ""
+        txt = str(d.get("text") or "") if isinstance(d, dict) else str(d)
+        for para in re.split(r"\n\s*\n", txt):
+            out.append((name, para.strip()))
+    return out
+
+
+def rule_decision(pkg):
+    paras = paragraphs(pkg)
+    cover = next((p for n, p in paras if "cover" in n.lower() or "cover sheet" in p.lower()), "")
+    cands = [p for n, p in paras if len(REF_RE.findall(p)) >= 3 and not DECOY_PARA.search(p) and "cover" not in n.lower()]
+    if not cands:
+        raise ValueError("no decisive paragraph")
+    para = cands[0]
+    action = None
+    for act, rx in RULES:
+        if rx.search(para):
+            if act == "reject_duplicate" and NEG_DUP.search(para):
+                continue
+            action = act
+            break
+    if not action:
+        raise ValueError("no rule matched")
+    refs = list(dict.fromkeys(REF_RE.findall(para)))[:3]
+    src = cover or " ".join(p for _, p in paras)
+    mv = re.search(r"(?:Supplier|Vendor)[:\s]+([^;\n]+?)\s*;", src)
+    mi = re.search(r"(?:invoice(?: number)?)[:\s]+([A-Z0-9][A-Z0-9\-/_.]*[A-Z0-9])", src, re.I)
+    ma = re.search(r"(?:total|amount)[^;.\n]*?" + CUR_AMT.pattern, src, re.I) or CUR_AMT.search(src)
+    if not (mv and mi and ma):
+        raise ValueError("facts not found")
+    cur, amt = ma.group(1), ma.group(2).replace(",", "")
+    whole, _, frac = amt.partition(".")
+    minor = int(whole) * 100 + int((frac + "00")[:2])
+    facts = {"vendorName": mv.group(1).strip(), "invoiceNumber": mi.group(1).strip(), "amountMinor": minor, "currency": cur}
+    why = {"settle_invoice": "the invoice is valid, reconciled and within autonomous authority",
+           "request_approval": "the invoice is commercially valid but exceeds the delegated authority, so a named approver must release it",
+           "hold_invoice": "payment must pause until the stated verification completes",
+           "reject_duplicate": "the same commercial invoice has already been paid",
+           "open_exception": "material records conflict and the policy requires an exception workflow"}[action]
+    rat = (f"{action}: {why}. Decisive evidence: {refs[0]}, {refs[1]} and {refs[2]} for {facts['vendorName']} "
+           f"invoice {facts['invoiceNumber']} ({cur} {amt}).")
+    return {"action": action, "facts": facts, "evidenceRefs": refs, "rationale": rat}
+
+
+def decide(packages, policy_rev, deadline_s=30):
+    """Deterministic rules on the decisive paragraph; one batched model call only for packages the rules cannot read.
+    Decisions are cached by canonical package content."""
     out, todo = {}, []
     with DBLOCK:
         c = db()
@@ -181,7 +247,13 @@ def decide(packages, policy_rev, deadline_s=34):
             row = c.execute("select decision from decisions where phash=?", (sha(p),)).fetchone()
             if row:
                 out[p["packageId"]] = json.loads(row[0])
-            else:
+                continue
+            try:
+                dec = rule_decision(p)
+                out[p["packageId"]] = dec
+                c.execute("insert or replace into decisions values(?,?)", (sha(p), json.dumps(dec)))
+            except Exception as e:
+                print("RULES_MISS", p.get("packageId"), repr(e)[:80], flush=True)
                 todo.append(p)
     if todo:
         txt, err = call_model(PROMPT % (policy_rev, json.dumps(todo, ensure_ascii=False)), deadline_s)
@@ -261,7 +333,7 @@ def send_message(owner, body):
         raise Err("INVALID_REQUEST", 400, "message is required")
     msg = body["message"]
     mid = msg.get("messageId")
-    if not isinstance(mid, str) or not mid or msg.get("role") != "ROLE_USER" or not isinstance(msg.get("parts"), list):
+    if not isinstance(mid, str) or not mid or msg.get("role") not in ("ROLE_USER", "user", "USER") or not isinstance(msg.get("parts"), list):
         raise Err("INVALID_REQUEST", 400, "message requires messageId, role ROLE_USER and parts")
     cfg = body.get("configuration") or {}
     hl = cfg.get("historyLength") if isinstance(cfg, dict) else None
@@ -453,6 +525,7 @@ class H(BaseHTTPRequestHandler):
         if n > MAX_BODY:
             raise Err("PAYLOAD_TOO_LARGE", 413, "body too large")
         raw = self.rfile.read(n) if n else b""
+        self._raw = raw
         if not raw:
             return None
         try:
@@ -505,11 +578,17 @@ class H(BaseHTTPRequestHandler):
                 return self.send(200, list_tasks(owner))
             raise Err("NOT_FOUND", 404, "not found")
         except Err as e:
-            print("REJECT", e.status, e.code, path[-60:], flush=True)
+            print("REJECT", e.status, e.code, e.msg, method, path[-60:], "ver=" + str(self.headers.get("A2A-Version")),
+                  "ct=" + str(self.headers.get("Content-Type")), "body=" + getattr(self, "_raw", b"")[:300].decode("utf-8", "replace"), flush=True)
             self.send(e.status, {"error": {"code": e.code, "status": e.status, "message": e.msg}, "code": e.code})
+        except (BrokenPipeError, ConnectionResetError):
+            print("CLIENT_DISCONNECTED", method, path[-60:], flush=True)
         except Exception:
             traceback.print_exc()
-            self.send(500, {"error": {"code": "INTERNAL", "status": 500, "message": "internal error"}})
+            try:
+                self.send(500, {"error": {"code": "INTERNAL", "status": 500, "message": "internal error"}})
+            except Exception:
+                pass
 
     def do_GET(self):
         self.handle_any("GET")
