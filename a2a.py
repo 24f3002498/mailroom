@@ -175,16 +175,18 @@ def fallback_decision(pkg):
 DECOY_PARA = re.compile(r"archive note|training appendix|non-operative|vocabulary, not case|cover sheet|training example|"
                         r"labelled as training|hypothetical", re.I)
 RULES = [
-    ("hold_invoice", re.compile(r"callback|call-back|destination[- ]account|newly supplied bank|new bank account|"
-                                r"remittance (?:be )?moved|payment[- ]detail change|changed (?:remittance |bank |payment )?instructions|"
-                                r"bank[- ]detail change|verification (?:is )?(?:still )?(?:pending|incomplete|open)", re.I)),
+    ("reject_duplicate", re.compile(r"(?<!no )earlier (?:posting|settled entry|settlement|payment)|already (?:been )?(?:paid|settled|discharged)|"
+                                    r"completed payment|same commercial key|same instrument|second (?:disbursement|settlement|payment)|"
+                                    r"commercial duplicate|requires rejection|duplicate[- ]control policy requires", re.I)),
+    ("hold_invoice", re.compile(r"callback|call-back|destination[- ]account|newly supplied bank|new bank account|beneficiary|"
+                                r"remittance (?:be )?moved|payment[- ](?:detail|change)|changed (?:remittance |bank |payment )?instructions|"
+                                r"out-of-band|pre-existing contact|known[- ]channel|verification (?:is )?(?:still )?(?:pending|incomplete|open)|"
+                                r"has not completed", re.I)),
     ("request_approval", re.compile(r"authority|delegat|ceiling|approver|escalation|approval workflow", re.I)),
-    ("reject_duplicate", re.compile(r"same commercial key|already (?:been )?(?:paid|settled)|completed payment|"
-                                    r"requires rejection|duplicate[- ]control policy requires", re.I)),
-    ("open_exception", re.compile(r"(?:outside|beyond)[^.]*tolerance|contradict|incompatible|conflicts? with|"
-                                  r"exception (?:case|queue|workflow)|discrepan(?:cy|cies) remains? unresolved", re.I)),
-    ("settle_invoice", re.compile(r"reconcil|no earlier posting|no prior (?:settlement|payment|posting)|full quantity|"
-                                  r"three-way match|quantity received|within the stated", re.I)),
+    ("open_exception", re.compile(r"(?:outside|beyond)[^.]*tolerance|does not reconcile|contradict|incompatible|conflicts? with|"
+                                  r"record conflicts|exception (?:case|queue|workflow|process)|discrepan(?:cy|cies) remains? unresolved", re.I)),
+    ("settle_invoice", re.compile(r"reconcil|no earlier posting|no prior (?:settlement|payment|posting)|no paid item|full quantity|"
+                                  r"three-way match|quantity received|every billed unit|same payable total|within the stated", re.I)),
 ]
 NEG_DUP = re.compile(r"different invoice|another invoice|not the same", re.I)
 CUR_AMT = re.compile(r"\b([A-Z]{3})\s*([0-9][0-9,]*(?:\.[0-9]+)?)\b")
@@ -200,7 +202,84 @@ def paragraphs(pkg):
     return out
 
 
+AUDIT_DECOY = re.compile(r"archived|archive examples|unrelated order|separate supplier|training case|previous quarter|"
+                         r"historical bank transfer|govern no live case|for a different order", re.I)
+MONEY = r"([A-Z]{3})\s*([0-9][0-9,]*(?:\.[0-9]+)?)"
+
+
+def to_minor(x):
+    whole, _, frac = x.replace(",", "").partition(".")
+    return int(whole) * 100 + int((frac + "00")[:2])
+
+
+def structured_decision(pkg):
+    lines = []
+    for _, para in paragraphs(pkg):
+        refs = REF_RE.findall(para)
+        if len(refs) == 1 and para.startswith(refs[0]) and not AUDIT_DECOY.search(para):
+            lines.append((refs[0], para))
+    text = " ".join(p for _, p in lines)
+    if len(lines) < 2:
+        raise ValueError("not a structured package")
+    cur_order = None
+    for rx in (r"currently submitted order is (PO-[\w-]+)", r"Order (PO-[\w-]+) is signed", r"covers order (PO-[\w-]+)"):
+        m = re.search(rx, text)
+        if m:
+            cur_order = m.group(1).rstrip("."); break
+    settled = re.search(r"previously settled order (PO-[\w-]+)", text)
+    inv_total = re.search(r"submitted invoice total is " + MONEY, text)
+    signed = re.search(r"is signed for " + MONEY, text)
+    instr = re.search(r"instrument (INV-[\w-]+) covers order (PO-[\w-]+), payee (AC-[\w-]+) and " + MONEY, text)
+    ledger = re.search(r"disbursement for " + MONEY + r" to (.+?) previously settled", text)
+    master = re.search(r"Vendor master lists account (AC-[\w-]+)", text)
+    remit = re.search(r"Remittance instructions now specify (AC-[\w-]+)", text)
+    cb_ok = re.search(r"callback[^.]*\b(confirmed|verified|completed)\b", text, re.I) and not re.search(r"awaiting|pending|not (?:yet )?(?:confirmed|completed)", text, re.I)
+    ceiling = re.search(r"ceiling for [A-Z]{3} is " + MONEY, text)
+    if inv_total:
+        cur, amt = inv_total.group(1), inv_total.group(2)
+    elif instr:
+        cur, amt = instr.group(4), instr.group(5)
+    elif signed:
+        cur, amt = signed.group(1), signed.group(2)
+    elif ledger:
+        cur, amt = ledger.group(1), ledger.group(2)
+    else:
+        raise ValueError("no amount")
+    minor = to_minor(amt)
+    if settled and cur_order and settled.group(1).rstrip(".") == cur_order:
+        action = "reject_duplicate"
+    elif (signed and inv_total and (signed.group(1) != inv_total.group(1) or to_minor(signed.group(2)) != to_minor(inv_total.group(2)))) \
+            or re.search(r"does not confirm|short|corrected invoice exists|differs|mismatch", text, re.I) and not re.search(r"No corrected invoice exists", text):
+        action = "open_exception"
+    elif (master and remit and master.group(1) != remit.group(1) and not cb_ok) or (remit and not cb_ok and re.search(r"awaiting|pending", text, re.I)):
+        action = "hold_invoice"
+    elif ceiling and ceiling.group(1) == cur and minor > to_minor(ceiling.group(2)):
+        action = "request_approval"
+    else:
+        action = "settle_invoice"
+    refs = [r for r, _ in lines][:3]
+    if len(refs) != 3:
+        raise ValueError("expected three decisive lines, got %d" % len(refs))
+    vendor = (ledger.group(3).strip() if ledger else None) or (instr.group(3) if instr else None) or "unknown"
+    invoice = (instr.group(1) if instr else None) or cur_order or "unknown"
+    facts = {"vendorName": vendor, "invoiceNumber": invoice, "amountMinor": minor, "currency": cur}
+    why = {"settle_invoice": "the order, receipt and invoice agree, no duplicate or unverified bank change exists and the total is within the autonomous ceiling",
+           "request_approval": "the invoice is valid but its total exceeds the autonomous payment ceiling, so a named approver must release it",
+           "hold_invoice": "the remittance account differs from the vendor master and the callback verification is still pending",
+           "reject_duplicate": "the payment ledger shows this same order was already settled",
+           "open_exception": "the signed order and the submitted invoice differ materially, which requires the exception process"}[action]
+    return {"action": action, "facts": facts, "evidenceRefs": refs,
+            "rationale": f"{action}: {why}. Decisive evidence: {refs[0]}, {refs[1]} and {refs[2]}."}
+
+
 def rule_decision(pkg):
+    try:
+        return paragraph_decision(pkg)
+    except ValueError:
+        return structured_decision(pkg)
+
+
+def paragraph_decision(pkg):
     paras = paragraphs(pkg)
     cover = next((p for n, p in paras if "cover" in n.lower() or "cover sheet" in p.lower()), "")
     cands = [p for n, p in paras if len(REF_RE.findall(p)) >= 3 and not DECOY_PARA.search(p) and "cover" not in n.lower()]
@@ -295,8 +374,8 @@ def check_version(headers):
 
 def check_media(headers):
     ct = (headers.get("content-type") or "").split(";")[0].strip().lower()
-    if ct not in (A2A_MT, "application/json"):
-        raise Err("UNSUPPORTED_MEDIA_TYPE", 415, "Content-Type must be application/a2a+json or application/json")
+    if ct != A2A_MT:
+        raise Err("UNSUPPORTED_MEDIA_TYPE", 415, "Content-Type must be application/a2a+json")
 
 
 def task_view(task, history_length=None):
