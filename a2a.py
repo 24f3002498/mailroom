@@ -599,12 +599,32 @@ class H(BaseHTTPRequestHandler):
             return None
         return path[len(BASE):]
 
-    def body(self):
+    def drain(self):
+        """Read the whole request body up front so an early rejection never leaves bytes on a keep-alive connection."""
+        if getattr(self, "_drained", False):
+            return
+        self._drained = True
+        self._raw = b""
         n = int(self.headers.get("Content-Length") or 0)
         if n > MAX_BODY:
+            self.close_connection = True
             raise Err("PAYLOAD_TOO_LARGE", 413, "body too large")
-        raw = self.rfile.read(n) if n else b""
-        self._raw = raw
+        if n:
+            self._raw = self.rfile.read(n)
+        elif "chunked" in (self.headers.get("Transfer-Encoding") or "").lower():
+            chunks = []
+            while True:
+                size = int(self.rfile.readline().split(b";")[0].strip() or b"0", 16)
+                if size == 0:
+                    self.rfile.readline()
+                    break
+                chunks.append(self.rfile.read(size))
+                self.rfile.readline()
+            self._raw = b"".join(chunks)
+
+    def body(self):
+        self.drain()
+        raw = self._raw
         if not raw:
             return None
         try:
@@ -614,6 +634,11 @@ class H(BaseHTTPRequestHandler):
 
     def handle_any(self, method):
         path = self.path.split("?")[0]
+        self._drained = False
+        try:
+            self.drain()
+        except Err as e:
+            return self.send(e.status, {"error": {"code": e.code, "status": e.status, "message": e.msg}, "code": e.code})
         print("REQ", method, self.path[:100], "auth=" + ("yes" if self.headers.get("Authorization") else "no"),
               "ver=" + str(self.headers.get("A2A-Version")), "ct=" + str(self.headers.get("Content-Type")), flush=True)
         try:
@@ -644,7 +669,7 @@ class H(BaseHTTPRequestHandler):
                 return self.send(200, out)
             m = re.fullmatch(r"/tasks/([^/:]+):cancel", r)
             if method == "POST" and m:
-                if int(self.headers.get("Content-Length") or 0):
+                if self._raw:
                     check_media(h)
                     self.body()
                 out = cancel_task(owner, urllib.request.unquote(m.group(1)))
