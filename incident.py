@@ -359,7 +359,8 @@ CAUSE_CUES = {
     "database_connection_exhaustion": r"\bpool\b|connection ceiling|database-pool|lease timeouts|pool acquisition|checkout wait",
     "dependency_certificate_expired": r"certificate|notAfter|\bTLS\b",
     "feature_flag_recursion": r"\bflag[_ ]|flag cohort|recursi|depth guard",
-    "traffic_capacity_exhaustion": r"requests per second|per-replica utilization|queue depth and latency|capacity ceiling",
+    "traffic_capacity_exhaustion": r"requests per second|per-replica utilization|utilization (?:is )?pinned|queue depth and latency|"
+                                   r"capacity ceiling|traffic spike|follows traffic|under incoming load|drains (?:one shard|additional)",
     "secret_rotation_mismatch": r"secret version|vault|revok|credential",
 }
 
@@ -386,7 +387,7 @@ def signal_lines(lines, order):
 def clause_hits(rx, text):
     """Count cue hits in clauses that are not negated (e.g. 'no release or flag changed')."""
     n = 0
-    for cl in re.split(r"[;.,]| while | and ", text):
+    for cl in re.split(r"[;.]", text):
         if re.search(rx, cl, re.I) and not NEG_RE.search(cl):
             n += 1
     return n
@@ -675,9 +676,7 @@ def apply_receipt(run, r):
         if any(d["state"] == "failed" for d in diags):
             failed = [d for d in diags if d["state"] == "failed"]
             timeout = any(x["receipt"] and x["receipt"].get("errorType") == "timeout" for d in failed for x in d["attempts"])
-            run["chosenEffect"] = act["toolName"]            # chosen, but suppressed because its prerequisite failed
-            run["suppressed"].append({"actionId": act["actionId"], "toolName": act["toolName"],
-                                      "reason": "prerequisite_timeout" if timeout else "prerequisite_failed"})
+            run["suppressed"].append(act["toolName"])
         else:
             run["actions"].append(act)
             run["chosenEffect"] = act["toolName"]
@@ -696,8 +695,7 @@ def apply_receipt(run, r):
         run["status"] = "waiting"
         return waiting_view(run, dispatches, approvals)
     effect = next((a for a in run["actions"] if a["phase"] == "effect"), None)
-    timed_out = any(x.get("reason") == "prerequisite_timeout" for x in run["suppressed"])
-    run["status"] = "completed" if (effect and effect["state"] == "succeeded") or timed_out else "failed"
+    run["status"] = "completed" if effect and effect["state"] == "succeeded" else "failed"
     return final_view(run)
 
 
