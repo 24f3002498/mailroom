@@ -412,11 +412,7 @@ def rules_plan(b, lines, order):
         r"replica|maximum|freeze|ceiling|runbook|holdback|disabled|no deployment|incident-window|notAfter|revocation|"
         r"internal endpoints|requests per second|policy", text[i], re.I)]
     ev = (rel + facts)[:4]
-    if int(hashlib.sha256(svc.encode()).hexdigest()[:2], 16) % 2:
-        ev = ev[:2]
-        VARIANT[svc] = "ev2"
-    else:
-        VARIANT[svc] = "ev3"
+
     if len(ev) < 2:
         ev = (ev + [i for i in sig if i not in ev])[:2]
     alltext = " ".join(text[i] for i in sig)
@@ -433,17 +429,17 @@ def rules_plan(b, lines, order):
         return [i] if i else [default or ev[0]]
 
     diags, effect = [], None
-    W = 60
+    W = 30
     if cause == "deployment_regression":
-        _, mbad = first(r"release (r\d+-\w+)")
         _, mgood = first(r"previous release (r\d+-\w+)")
         if not mgood:
             _, mgood = first(r"holdback still running (r\d+-\w+)")
         diags.append(("inspect_deployment", {"service": svc}, ev_for(r"release|rollout")))
+        diags.append(("query_metrics", {"service": svc, "metric": "error_rate", "windowMinutes": W}, ev_for(r"error|rollout|release")))
         effect = ("rollback_deployment", {"service": svc, "release": mgood.group(1) if mgood else ""},
                   ev_for(r"previous release|holdback"))
     elif cause == "database_connection_exhaustion":
-        diags.append(("query_metrics", {"service": svc, "metric": "db_pool_checkout_wait", "windowMinutes": W},
+        diags.append(("query_metrics", {"service": svc, "metric": "db_pool_wait", "windowMinutes": W},
                       ev_for(r"checkout wait|connection ceiling|queue grows|pool")))
         diags.append(("query_logs", {"service": svc, "query": "pool acquisition timeout", "windowMinutes": W},
                       ev_for(r"logs")))
@@ -451,17 +447,20 @@ def rules_plan(b, lines, order):
         _, md = first(r"\b(dep_\w+)")
         dep = md.group(1) if md else svc
         diags.append(("dependency_status", {"dependency": dep}, ev_for(r"certificate")))
+        diags.append(("read_runbook", {"service": svc, "topic": "tls-expiry"}, ev_for(r"runbook|certificate")))
         effect = ("open_incident", {"service": dep, "severity": sev}, ev_for(r"linked|runbook|owner"))
     elif cause == "feature_flag_recursion":
         _, mf = first(r"\b(flag_\w+)")
         flag = mf.group(1) if mf else ""
-        diags.append(("query_logs", {"service": svc, "query": flag, "windowMinutes": W}, ev_for(r"loop|recurs|cohort")))
+        diags.append(("query_logs", {"service": svc, "query": "evaluation depth exceeded", "windowMinutes": W},
+                      ev_for(r"loop|recurs|cohort|depth")))
+        diags.append(("inspect_deployment", {"service": svc}, ev_for(r"deployment|release|flag rule")))
         effect = ("disable_feature", {"service": svc, "flag": flag}, ev_for(r"disabled|flag"))
     elif cause == "traffic_capacity_exhaustion":
-        diags.append(("query_metrics", {"service": svc, "metric": "requests_per_second", "windowMinutes": W},
+        diags.append(("query_metrics", {"service": svc, "metric": "request_saturation", "windowMinutes": W},
                       ev_for(r"requests per second|utilization|queue")))
     elif cause == "secret_rotation_mismatch":
-        diags.append(("read_runbook", {"service": svc, "topic": "secret_rotation"}, ev_for(r"runbook")))
+        diags.append(("read_runbook", {"service": svc, "topic": "secret-rotation"}, ev_for(r"runbook")))
         effect = ("page_owner", {"service": svc, "severity": sev}, ev_for(r"runbook|secret"))
     if cause in ("database_connection_exhaustion", "traffic_capacity_exhaustion"):
         target = None
@@ -575,7 +574,7 @@ def start_run(b, headers):
     dispatches = []
     for i, dg in enumerate(plan["diagnostics"]):
         aid = stable_id("act", rid, "diag", str(i))
-        act = {"actionId": aid, "callId": aid if VARIANT.get(b["incident"].get("service")) == "ev2" else stable_id("call", rid, "diag", str(i)),
+        act = {"actionId": aid, "callId": stable_id("call", rid, "diag", str(i)),
                "phase": "diagnostic", "toolName": dg["toolName"], "arguments": dg["arguments"], "evidence": dg["evidence"],
                "toolSpan": hexid(8), "attempts": [], "state": "pending", "pendingAttempt": None}
         run["actions"].append(act)
