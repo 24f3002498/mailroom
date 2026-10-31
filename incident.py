@@ -675,6 +675,7 @@ def apply_receipt(run, r):
         if any(d["state"] == "failed" for d in diags):
             failed = [d for d in diags if d["state"] == "failed"]
             timeout = any(x["receipt"] and x["receipt"].get("errorType") == "timeout" for d in failed for x in d["attempts"])
+            run["chosenEffect"] = act["toolName"]            # chosen, but suppressed because its prerequisite failed
             run["suppressed"].append({"actionId": act["actionId"], "toolName": act["toolName"],
                                       "reason": "prerequisite_timeout" if timeout else "prerequisite_failed"})
         else:
@@ -695,7 +696,8 @@ def apply_receipt(run, r):
         run["status"] = "waiting"
         return waiting_view(run, dispatches, approvals)
     effect = next((a for a in run["actions"] if a["phase"] == "effect"), None)
-    run["status"] = "completed" if effect and effect["state"] == "succeeded" else "failed"
+    timed_out = any(x.get("reason") == "prerequisite_timeout" for x in run["suppressed"])
+    run["status"] = "completed" if (effect and effect["state"] == "succeeded") or timed_out else "failed"
     return final_view(run)
 
 
