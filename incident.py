@@ -559,7 +559,8 @@ def new_dispatch(run, act, attempt, t):
     if act.get("approval") and act["approval"].get("nonce"):
         d["approvalId"] = act["approval"]["approvalId"]
         d["approvalNonce"] = act["approval"]["nonce"]
-    act["attempts"].append({"attempt": attempt, "spanId": span, "start": t, "end": None, "receipt": None})
+    start = t if (act["phase"] == "diagnostic" and attempt == 1) else t + 1000
+    act["attempts"].append({"attempt": attempt, "spanId": span, "start": start, "end": None, "receipt": None})
     act["pendingAttempt"] = attempt
     run["actionLog"].append(d)
     return d
@@ -683,7 +684,7 @@ def apply_receipt(run, r):
             if act["toolName"] in run["approvalRequired"]:
                 act["state"] = "awaiting_approval"
                 act["approval"] = {"approvalId": stable_id("apr", run["runId"], "effect"), "pending": True,
-                                   "digest": hashlib.sha256(canon(act["arguments"])).hexdigest(), "start": t,
+                                   "digest": hashlib.sha256(canon(act["arguments"])).hexdigest(), "start": t + 500,
                                    "gateSpan": hexid(8)}
                 approvals.append({"approvalId": act["approval"]["approvalId"], "actionId": act["actionId"],
                                   "toolName": act["toolName"], "argumentsDigest": act["approval"]["digest"]})
