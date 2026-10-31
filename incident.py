@@ -433,11 +433,17 @@ def rules_plan(b, lines, order):
     if cause == "deployment_regression":
         _, mgood = first(r"previous release (r\d+-\w+)")
         if not mgood:
-            _, mgood = first(r"holdback still running (r\d+-\w+)")
+            _, mgood = first(r"holdback (?:still running |on |running )?(r\d+-\w+)")
         diags.append(("inspect_deployment", {"service": svc}, ev_for(r"release|rollout")))
         diags.append(("query_metrics", {"service": svc, "metric": "error_rate", "windowMinutes": W}, ev_for(r"error|rollout|release")))
-        effect = ("rollback_deployment", {"service": svc, "release": mgood.group(1) if mgood else ""},
-                  ev_for(r"previous release|holdback"))
+        dl = re.search(r"delegation=(\d+)", alltext)
+        fz = re.search(r"freeze=(\d+)", alltext)
+        rem = re.search(r"remaining (?:approved )?(?:reversions|changes)=(\d+)", alltext)
+        blocked = (dl and int(dl.group(1)) != 1) or (fz and int(fz.group(1)) != 0) or (rem and int(rem.group(1)) <= 0) or not mgood
+        if blocked:
+            effect = ("page_owner", {"service": svc, "severity": sev}, ev_for(r"freeze|delegation|policy|page"))
+        else:
+            effect = ("rollback_deployment", {"service": svc, "release": mgood.group(1)}, ev_for(r"previous release|holdback"))
     elif cause == "database_connection_exhaustion":
         diags.append(("query_metrics", {"service": svc, "metric": "db_pool_wait", "windowMinutes": W},
                       ev_for(r"checkout wait|connection ceiling|queue grows|pool")))
@@ -448,7 +454,7 @@ def rules_plan(b, lines, order):
         dep = md.group(1) if md else svc
         diags.append(("dependency_status", {"dependency": dep}, ev_for(r"certificate")))
         diags.append(("read_runbook", {"service": svc, "topic": "tls-expiry"}, ev_for(r"runbook|certificate")))
-        effect = ("open_incident", {"service": dep, "severity": sev}, ev_for(r"linked|runbook|owner"))
+        effect = ("open_incident", {"service": svc, "severity": sev}, ev_for(r"linked|runbook|owner"))
     elif cause == "feature_flag_recursion":
         _, mf = first(r"\b(flag_\w+)")
         flag = mf.group(1) if mf else ""
