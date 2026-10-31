@@ -865,7 +865,7 @@ def handle_start(b, headers):
         if run:
             if old_h != h:
                 raise Bad(409, "runId already used with different content")
-            return run["firstResponse"]
+            return run.get("lastResponse") or run["firstResponse"]
     run, resp = start_run(b, headers)               # model call happens outside the lock
     resp = redact(resp, run["sensitive"])
     run["firstResponse"] = resp
@@ -875,7 +875,7 @@ def handle_start(b, headers):
         if other:
             if old_h != h:
                 raise Bad(409, "runId already used with different content")
-            return other["firstResponse"]
+            return other.get("lastResponse") or other["firstResponse"]
         save(c, run, h)
         if DEBUG_TOKEN:
             safe = {k: v for k, v in b.items() if k != "sensitive"}
@@ -898,7 +898,7 @@ def handle_receipt(rid, b):
         if row:
             if row[0] != h:
                 raise Bad(409, "receiptId already used with different content")
-            return json.loads(row[1])
+            return run.get("lastResponse") or json.loads(row[1])
         resp = apply_receipt(run, b)
         if run["status"] in ("completed", "failed"):
             resp = redact(resp, run["sensitive"])
